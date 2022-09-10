@@ -73,6 +73,9 @@ get_window_size(int *rows, int *cols)
     struct winsize ws;
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
+            return -1;
+        editor_read_key();
         return -1;
     } else {
         *cols = ws.ws_col;
@@ -102,7 +105,7 @@ editor_process_keypress()
 void
 editor_draw_rows()
 {
-    for (int y = 0; y < 24; y++) {
+    for (int y = 0; y < config.screen_rows; y++) {
         write(STDOUT_FILENO, "~\r\n", 3);
     }
 }
