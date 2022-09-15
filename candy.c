@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <string.h>
 #include <termios.h>
 #include <stdlib.h>
@@ -15,10 +16,13 @@ typedef struct erow {
 } erow;
 
 struct EditorConfig {
-    int cx, cy;
+    int cx, cy;  // cursor position
+    int rowoff;  // row offset
+    int coloff;  // column offset
     int screen_rows;
     int screen_cols;
-    int numrows;
+    int numrows;  // total amount of rows in current buffer
+    char *filename;
     erow *row;
     struct termios orig_termios;
 };
@@ -147,100 +151,12 @@ ab_free(struct  abuf *ab)
     free(ab->b);
 }
 
-/*** input ***/
-
-#define MV_UP    'k'
-#define MV_DOWN  'j'
-#define MV_LEFT  'h'
-#define MV_RIGHT 'l'
-
-void
-editor_move_cursor(char key)
-{
-    switch (key) {
-        case MV_DOWN:
-            config.cy = (config.cy != config.screen_rows - 1 ? config.cy + 1 : config.cy);
-            break;
-        case MV_UP:
-            config.cy = (config.cy != 0 ? config.cy - 1 : config.cy);
-            break;
-        case MV_LEFT:
-            config.cx = (config.cx != 0 ? config.cx - 1 : config.cx);
-            break;
-        case MV_RIGHT:
-            config.cx = (config.cx != config.screen_cols - 1 ? config.cx + 1 : config.cx);
-            break;
-    }
-
-}
-
-void
-editor_process_keypress()
-{
-    char c = editor_read_key();
-    switch (c) {
-        case CTRLKEY('q'):
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            exit(0);
-            break;
-        case MV_DOWN:
-        case MV_UP:
-        case MV_LEFT:
-        case MV_RIGHT:
-            editor_move_cursor(c);
-            break;
-    }
-}
-
-/*** output ***/
-
-void
-editor_draw_rows(struct abuf *ab)
-{
-    for (int y = 0; y < config.screen_rows; y++) {
-        if (y >= config.numrows) {
-            ab_append(ab, "~", 1);
-        } else {
-            int len = config.row[y].size;
-            if (len > config.screen_cols)
-                len = config.screen_cols;
-            ab_append(ab, config.row[y].chars, len);
-        }
-        ab_append(ab, "\x1b[K", 3);  // clear current line
-
-        if (y < config.screen_rows - 1) {
-            ab_append(ab, "\r\n", 2);
-        }
-    }
-}
-
-void
-editor_refresh_screen()
-{
-    struct abuf ab = ABUF_INIT;
-
-    ab_append(&ab, "\x1b[?25l", 6); // hide cursor
-    ab_append(&ab, "\x1b[H", 3);    // change position of cursor to 0,0
-
-    editor_draw_rows(&ab);
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.cy + 1, config.cx + 1);  // move cursor to certain position
-    ab_append(&ab, buf, strlen(buf));
-
-    ab_append(&ab, "\x1b[?25h", 6);  // show cursor (to avoid flickering when redraw)
-
-    write(STDOUT_FILENO, ab.b, ab.len);
-    ab_free(&ab);
-}
-
 /*** row operations ***/
 
 void
 editor_append_row(char *s, size_t len)
 {
-    config.row = realloc(config.row, sizeof(erow) + (config.numrows + 1));
+    config.row = realloc(config.row, sizeof(erow) * (config.numrows + 1));
 
     struct erow *r = &config.row[config.numrows];
     r->size = len;
@@ -252,7 +168,50 @@ editor_append_row(char *s, size_t len)
     config.numrows++;
 }
 
+void
+editor_row_insert_char(erow *row, int at, int c)
+{
+    if (at < 0 || at > row->size)
+        at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);  // 2 = new char and \0
+    memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+}
+
+/*** editor operations ***/
+void
+editor_insert_char(int c)
+{
+    // TODO: it shouldnt be possible for vim like editor
+    if (config.cy == config.numrows)
+        editor_append_row("", 0);
+
+    editor_row_insert_char(&config.row[config.cy], config.cx, c);
+    config.cx++;
+}
+
 /*** file i/o ***/
+
+char*
+editor_rows_to_string(int *len)
+{
+    int total = 0;
+    for (int i = 0; i < config.numrows; i++) {
+        total += config.row[i].size + 1;
+    }
+    *len = total;
+
+    char *buf = malloc(total);
+    char *p = buf;
+    for (int i = 0; i < config.numrows; i++) {
+        memcpy(p, config.row[i].chars, config.row[i].size);
+        p += config.row[i].size;
+        *p = '\n';
+        p++;
+    }
+    return buf;
+}
 
 void
 editor_open(char *filename)
@@ -260,6 +219,8 @@ editor_open(char *filename)
     FILE *fp = fopen(filename, "r");
     if (!fp)
         die("fopen");
+
+    config.filename = strdup(filename);
 
     char *line = NULL;
     size_t linecap = 0;
@@ -274,6 +235,163 @@ editor_open(char *filename)
     fclose(fp);
 }
 
+void
+editor_save()
+{
+    if (config.filename == NULL)
+        return;
+
+    int len;
+    char *buf = editor_rows_to_string(&len);
+
+    int fd = open(config.filename, O_RDWR | O_CREAT, 0644);
+    ftruncate(fd, len);
+    write(fd, buf, len);
+    close(fd);
+    free(buf);
+}
+
+/*** input ***/
+
+#define MV_UP    'k'
+#define MV_DOWN  'j'
+#define MV_LEFT  'h'
+#define MV_RIGHT 'l'
+
+void
+editor_move_cursor(char key)
+{
+    erow *row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
+
+    switch (key) {
+        case MV_DOWN:
+            config.cy = (config.cy < config.numrows - 1 ? config.cy + 1 : config.cy);
+            break;
+        case MV_UP:
+            config.cy = (config.cy != 0 ? config.cy - 1 : config.cy);
+            break;
+        case MV_LEFT:
+            config.cx = (config.cx > 1 ? config.cx - 1 : config.cx);
+            break;
+        case MV_RIGHT:
+            if (row && config.cx <= row->size - 1)
+                config.cx++;
+            break;
+    }
+
+    row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
+    int rowlen = row ? row->size : 0;
+    if (config.cx > rowlen)
+        config.cx = rowlen;
+}
+
+void
+editor_process_keypress()
+{
+    char c = editor_read_key();
+    switch (c) {
+        case CTRLKEY('q'):
+            write(STDOUT_FILENO, "\x1b[2J", 4);
+            write(STDOUT_FILENO, "\x1b[H", 3);
+            exit(0);
+            break;
+        case '\r':
+            break;
+        case CTRLKEY('d'):
+            config.cy += 10;
+            break;
+        case MV_DOWN:
+        case MV_UP:
+        case MV_LEFT:
+        case MV_RIGHT:
+            editor_move_cursor(c);
+            break;
+        case 'D':
+            editor_insert_char('h');
+            break;
+        case CTRLKEY('s'):
+            editor_save();
+            break;
+    }
+}
+
+/*** output ***/
+
+void
+editor_draw_status_bar(struct abuf *ab)
+{
+    ab_append(ab, "\x1b[7m", 4);
+
+    char buf[80];
+    int len = snprintf(buf, sizeof(buf), "%.20s - %d lines", config.filename ? config.filename : "No name", config.numrows);
+    len = len > config.screen_rows ? config.screen_rows : len;
+    ab_append(ab, buf, len);
+    while (len < config.screen_cols) {
+        ab_append(ab, " ", 1);
+        len++;
+    }
+    ab_append(ab, "\x1b[m", 4);
+}
+
+void
+editor_scroll()
+{
+    if (config.cy < config.rowoff)
+        config.rowoff = config.cy;
+
+    if (config.cy >= config.rowoff + config.screen_rows)
+        config.rowoff = config.cy - config.screen_rows + 1;
+
+    if (config.cx < config.coloff)
+        config.coloff = config.cx;
+        
+    if (config.cx >= config.coloff + config.screen_cols)
+        config.coloff = config.cx - config.screen_cols + 1;
+}
+
+void
+editor_draw_rows(struct abuf *ab)
+{
+    for (int y = 0; y < config.screen_rows; y++) {
+        int filerow = y + config.rowoff;
+        if (y >= config.numrows) {
+            ab_append(ab, "~", 1);
+        } else {
+            int len = config.row[filerow].size - config.coloff;
+            len = (len < 0) ? 0 : len;
+
+            ab_append(ab, &config.row[filerow].chars[config.coloff], len);
+        }
+        ab_append(ab, "\x1b[K", 3);  // clear current line
+
+        ab_append(ab, "\r\n", 2);
+    }
+}
+
+void
+editor_refresh_screen()
+{
+    editor_scroll();
+
+    struct abuf ab = ABUF_INIT;
+
+    ab_append(&ab, "\x1b[?25l", 6); // hide cursor
+    ab_append(&ab, "\x1b[H", 3);    // change position of cursor to 0,0
+
+    editor_draw_rows(&ab);
+    editor_draw_status_bar(&ab);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (config.cy - config.rowoff) + 1,
+                                              (config.cx - config.coloff) + 1);  // move cursor to certain position
+    ab_append(&ab, buf, strlen(buf));
+
+    ab_append(&ab, "\x1b[?25h", 6);  // show cursor (to avoid flickering when redraw)
+
+    write(STDOUT_FILENO, ab.b, ab.len);
+    ab_free(&ab);
+}
+
 /*** init ***/
 
 void
@@ -281,11 +399,15 @@ init_editor()
 {
     config.cx = 0;
     config.cy = 0;
+    config.rowoff = 0;
+    config.coloff = 0;
     config.numrows = 0;
     config.row = NULL;
+    config.filename = NULL;
 
     if (get_window_size(&config.screen_rows, &config.screen_cols) == -1)
         die("get_window_size");
+    config.screen_rows--;
 }
 
 int
