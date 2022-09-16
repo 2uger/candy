@@ -1,7 +1,9 @@
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <string.h>
+#include <time.h>
 #include <termios.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,12 +12,18 @@
 
 #define CTRLKEY(k) ((k) & 0x1f)
 
+typedef enum Mode {
+    INSERT,
+    VIEW
+} Mode;
+
 typedef struct erow {
     int size;
     char *chars;
 } erow;
 
 struct EditorConfig {
+    Mode mode;
     int cx, cy;  // cursor position
     int rowoff;  // row offset
     int coloff;  // column offset
@@ -23,11 +31,15 @@ struct EditorConfig {
     int screen_cols;
     int numrows;  // total amount of rows in current buffer
     char *filename;
+    char status_msg[80];
+    time_t status_msg_time;
     erow *row;
     struct termios orig_termios;
 };
 
 struct EditorConfig config;
+
+void editor_set_status_message(const char *fmt, ...);
 
 /*** terminal ***/
 
@@ -245,10 +257,20 @@ editor_save()
     char *buf = editor_rows_to_string(&len);
 
     int fd = open(config.filename, O_RDWR | O_CREAT, 0644);
-    ftruncate(fd, len);
-    write(fd, buf, len);
-    close(fd);
+    if (fd != -1) {
+        if (ftruncate(fd, len) != -1) {
+            if (write(fd, buf, len) == len) {
+                close(fd);
+                free(buf);
+                editor_set_status_message("Save file: %d bytes written to disk", len);
+                return;
+            }
+        }
+        close(fd);
+
+    }
     free(buf);
+    editor_set_status_message("Can't save!");
 }
 
 /*** input ***/
@@ -271,12 +293,24 @@ editor_move_cursor(char key)
             config.cy = (config.cy != 0 ? config.cy - 1 : config.cy);
             break;
         case MV_LEFT:
-            config.cx = (config.cx > 1 ? config.cx - 1 : config.cx);
+            config.cx = (config.cx > 0 ? config.cx - 1 : config.cx);
             break;
         case MV_RIGHT:
-            if (row && config.cx <= row->size - 1)
+            if (row && config.cx <= row->size - 2)
                 config.cx++;
             break;
+        case CTRLKEY('d'):
+            config.cy = (config.cy < config.numrows - 1 - 10 ? config.cy + 10 : config.numrows - 1);
+            break;
+        case CTRLKEY('u'):
+            config.cy = (config.cy > 10 ? config.cy - 10 : 0);
+            break;
+        case '$':
+            config.cx = row->size - 1; 
+            return;
+        case '0':
+            config.cx = 0;
+            return;
     }
 
     row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
@@ -289,29 +323,51 @@ void
 editor_process_keypress()
 {
     char c = editor_read_key();
-    switch (c) {
-        case CTRLKEY('q'):
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            exit(0);
-            break;
-        case '\r':
-            break;
-        case CTRLKEY('d'):
-            config.cy += 10;
-            break;
-        case MV_DOWN:
-        case MV_UP:
-        case MV_LEFT:
-        case MV_RIGHT:
-            editor_move_cursor(c);
-            break;
-        case 'D':
-            editor_insert_char('h');
-            break;
-        case CTRLKEY('s'):
-            editor_save();
-            break;
+    if (config.mode == VIEW) {
+        switch (c) {
+            case CTRLKEY('q'):
+                write(STDOUT_FILENO, "\x1b[2J", 4);
+                write(STDOUT_FILENO, "\x1b[H", 3);
+                exit(0);
+                break;
+            case '\r':
+                break;
+            case '$':
+            case '0':
+            case CTRLKEY('d'):
+            case CTRLKEY('u'):
+            case MV_DOWN:
+            case MV_UP:
+            case MV_LEFT:
+            case MV_RIGHT:
+                editor_move_cursor(c);
+                break;
+            case 'i':
+                config.mode = INSERT;
+                break;
+            case 'Z':
+                editor_save();
+                break;
+        }
+    } else if (config.mode == INSERT) {
+        switch (c) {
+            // TODO: for debug purposes
+            case CTRLKEY('q'):
+                write(STDOUT_FILENO, "\x1b[2J", 4);
+                write(STDOUT_FILENO, "\x1b[H", 3);
+                exit(0);
+                break;
+            case '\x1b':
+            case CTRLKEY('c'):
+                config.mode = VIEW;
+                break;
+            case '\r':
+            case 127:
+                break;
+            default:
+                editor_insert_char(c);
+                break;
+        }
     }
 }
 
@@ -323,7 +379,11 @@ editor_draw_status_bar(struct abuf *ab)
     ab_append(ab, "\x1b[7m", 4);
 
     char buf[80];
-    int len = snprintf(buf, sizeof(buf), "%.20s - %d lines", config.filename ? config.filename : "No name", config.numrows);
+    int len = snprintf(buf, sizeof(buf),
+                       "%.20s - %d lines, mode: %s\x1b[m\x1b[7m",
+                       config.filename ? config.filename : "No name",
+                       config.numrows,
+                       config.mode == VIEW ? "\x1b[32mVIEW" : "\x1b[31mINSERT");
     len = len > config.screen_rows ? config.screen_rows : len;
     ab_append(ab, buf, len);
     while (len < config.screen_cols) {
@@ -331,6 +391,22 @@ editor_draw_status_bar(struct abuf *ab)
         len++;
     }
     ab_append(ab, "\x1b[m", 4);
+}
+
+void
+editor_draw_message_bar(struct abuf *ab)
+{
+    int msglen = strlen(config.status_msg);
+    msglen = msglen > config.screen_cols ? config.screen_cols : msglen;
+    if (msglen && time(NULL) - config.status_msg_time < 3) {
+        ab_append(ab, config.status_msg, msglen);
+        return;
+    }
+    int l = 0;
+    while (l < config.screen_cols) {
+        ab_append(ab, " ", 1);
+        l++;
+    }
 }
 
 void
@@ -380,6 +456,7 @@ editor_refresh_screen()
 
     editor_draw_rows(&ab);
     editor_draw_status_bar(&ab);
+    editor_draw_message_bar(&ab);
 
     char buf[32];
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (config.cy - config.rowoff) + 1,
@@ -392,11 +469,22 @@ editor_refresh_screen()
     ab_free(&ab);
 }
 
+void
+editor_set_status_message(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(config.status_msg, sizeof(config.status_msg), fmt, ap);
+    va_end(ap);
+    config.status_msg_time = time(NULL);
+}
+
 /*** init ***/
 
 void
 init_editor()
 {
+    config.mode = VIEW;
     config.cx = 0;
     config.cy = 0;
     config.rowoff = 0;
@@ -404,10 +492,12 @@ init_editor()
     config.numrows = 0;
     config.row = NULL;
     config.filename = NULL;
+    config.status_msg[0] = '\0';
+    config.status_msg_time = time(NULL);
 
     if (get_window_size(&config.screen_rows, &config.screen_cols) == -1)
         die("get_window_size");
-    config.screen_rows--;
+    config.screen_rows -= 2;
 }
 
 int
