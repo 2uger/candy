@@ -14,7 +14,8 @@
 
 typedef enum Mode {
     INSERT,
-    VIEW
+    VIEW,
+    CLI
 } Mode;
 
 typedef struct erow {
@@ -34,12 +35,14 @@ struct EditorConfig {
     char status_msg[80];
     time_t status_msg_time;
     erow *row;
+    char cli_buf[10];
     struct termios orig_termios;
 };
 
 struct EditorConfig config;
 
 void editor_set_status_message(const char *fmt, ...);
+void editor_save();
 
 /*** terminal ***/
 
@@ -135,6 +138,26 @@ get_window_size(int *rows, int *cols)
     
 }
 
+/*** Cli prompt ***/
+
+void
+editor_process_cli_cmd()
+{
+    switch (config.cli_buf[0]) {
+        case 'w':
+            editor_save();
+            break;
+        case 'q':
+            write(STDOUT_FILENO, "\x1b[2J", 4);
+            write(STDOUT_FILENO, "\x1b[H", 3);
+            exit(0);
+            break;
+        default:
+            editor_set_status_message("Undefined cmd");
+            break;
+    }
+}
+
 /*** Append buffer ***/
 
 #define ABUF_INIT {NULL, 0}
@@ -166,11 +189,15 @@ ab_free(struct  abuf *ab)
 /*** row operations ***/
 
 void
-editor_append_row(char *s, size_t len)
+editor_insert_row(int at, char *s, size_t len)
 {
-    config.row = realloc(config.row, sizeof(erow) * (config.numrows + 1));
+    if (at < 0 || at > config.numrows)
+        return;
 
-    struct erow *r = &config.row[config.numrows];
+    config.row = realloc(config.row, sizeof(erow) * (config.numrows + 1));
+    memmove(&config.row[at + 1], &config.row[at], sizeof(erow) * (config.numrows - at));
+
+    struct erow *r = &config.row[at];
     r->size = len;
     r->chars = malloc(len + 1);
     memcpy(r->chars, s, len);
@@ -178,6 +205,16 @@ editor_append_row(char *s, size_t len)
     r->chars[len] = '\0';
 
     config.numrows++;
+}
+
+void
+editor_del_row(int at)
+{
+    if (at < 0 || at > config.numrows)
+        return;
+    free(config.row[at].chars);
+    memmove(&config.row[at], &config.row[at + 1], sizeof(erow) * (config.numrows - at - 1));
+    config.numrows--;
 }
 
 void
@@ -191,16 +228,71 @@ editor_row_insert_char(erow *row, int at, int c)
     row->chars[at] = c;
 }
 
+void
+editor_row_append_string(erow *row, char *s, size_t len)
+{
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(&row->chars[row->size], s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+}
+
+void
+editor_row_del_char(erow *row, int at)
+{
+    if (at < 0 || at > row->size)
+        return;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size--;
+}
+
 /*** editor operations ***/
+
+void
+editor_insert_new_line()
+{
+    if (config.cx == 0) {
+        editor_insert_row(config.cy, "", 0);
+    } else {
+        erow *row = &config.row[config.cy];
+        editor_insert_row(config.cy + 1, &row->chars[config.cx], row->size - config.cx);
+        row = &config.row[config.cy];
+        row->size = config.cx;
+        row->chars[row->size] = '\0';
+    }
+    config.cy++;
+    config.cx = 0;
+}
+
 void
 editor_insert_char(int c)
 {
     // TODO: it shouldnt be possible for vim like editor
     if (config.cy == config.numrows)
-        editor_append_row("", 0);
+        editor_insert_row(config.numrows, "", 0);
 
     editor_row_insert_char(&config.row[config.cy], config.cx, c);
     config.cx++;
+}
+
+void
+editor_del_char()
+{
+    if (config.cy == config.numrows)
+        return;
+    if (config.cx == 0 && config.cy == 0)
+        return;
+
+    erow *row = &config.row[config.cy];
+    if (config.cx > 0) {
+        editor_row_del_char(row, config.cx - 1);
+        config.cx--;
+    } else {
+        config.cx = config.row[config.cy - 1].size;
+        editor_row_append_string(&config.row[config.cy - 1], row->chars, row->size);
+        editor_del_row(config.cy);
+        config.cy--;
+    }
 }
 
 /*** file i/o ***/
@@ -241,7 +333,7 @@ editor_open(char *filename)
     while ((linelen = getline(&line, &linecap, fp)) != -1) {
         while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
             linelen--;
-        editor_append_row(line, linelen);
+        editor_insert_row(config.numrows, line, linelen);
     }
     free(line);
     fclose(fp);
@@ -285,6 +377,7 @@ editor_move_cursor(char key)
 {
     erow *row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
 
+    int space = 0;
     switch (key) {
         case MV_DOWN:
             config.cy = (config.cy < config.numrows - 1 ? config.cy + 1 : config.cy);
@@ -311,6 +404,52 @@ editor_move_cursor(char key)
         case '0':
             config.cx = 0;
             return;
+        case 'w':
+            for (int i = config.cx; i < row->size; i++) {
+                if (row->chars[i] == ' ') {
+                    for (int j = i; j < row->size; j++) {
+                        if (row->chars[j] != ' ') {
+                            config.cx = j;
+                            return;
+                        }
+                    }
+                }
+                if (33 <= row->chars[i] && row->chars[i] <= 46) {
+                    if (i == config.cx) {
+                        if (row->chars[i + 1] != ' ') {
+                            config.cx = i + 1;
+                            return;
+                        } else
+                            continue;
+                    }
+                    config.cx = i;
+                    return;
+                }
+            }
+            return;
+        case 'b':
+            // TODO: make movement to the start of the word
+            for (int i = config.cx; i >= 0; i--) {
+                if (row->chars[i] == ' ') {
+                    for (int j = i; j >= 0; j--) {
+                        if (row->chars[j] != ' ') {
+                            config.cx = j;
+                            return;
+                        }
+                    }
+                }
+                if (33 <= row->chars[i] && row->chars[i] <= 46) {
+                    if (i == config.cx) {
+                        if (row->chars[i - 1] != ' ') {
+                            config.cx = i - 1;
+                            return;
+                        } else
+                            continue;
+                    }
+                    config.cx = i;
+                    return;
+                }
+            }
     }
 
     row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
@@ -325,6 +464,9 @@ editor_process_keypress()
     char c = editor_read_key();
     if (config.mode == VIEW) {
         switch (c) {
+            case ':':
+                config.mode = CLI;
+                break;
             case CTRLKEY('q'):
                 write(STDOUT_FILENO, "\x1b[2J", 4);
                 write(STDOUT_FILENO, "\x1b[H", 3);
@@ -332,6 +474,8 @@ editor_process_keypress()
                 break;
             case '\r':
                 break;
+            case 'b':
+            case 'w':
             case '$':
             case '0':
             case CTRLKEY('d'):
@@ -348,6 +492,9 @@ editor_process_keypress()
             case 'Z':
                 editor_save();
                 break;
+            case 'x':
+                editor_del_char();
+                break;
         }
     } else if (config.mode == INSERT) {
         switch (c) {
@@ -362,16 +509,43 @@ editor_process_keypress()
                 config.mode = VIEW;
                 break;
             case '\r':
+                editor_insert_new_line();
+                break;
             case 127:
+                editor_del_char();
                 break;
             default:
                 editor_insert_char(c);
                 break;
         }
+    } else if (config.mode == CLI) {
+        switch (c) {
+            case '\x1b':
+                config.mode = VIEW;
+                break;
+            case '\r':
+                config.mode = VIEW;
+                editor_process_cli_cmd();
+                break;
+            default:
+                config.cli_buf[0] = c;
+                break;
+        }
+
     }
 }
 
 /*** output ***/
+
+void
+editor_draw_cli_prompt(struct abuf *ab)
+{
+    // TODO: erase old
+    if (config.mode == CLI) {
+        ab_append(ab, ":", 1);
+        ab_append(ab, config.cli_buf, 1);
+    }
+}
 
 void
 editor_draw_status_bar(struct abuf *ab)
@@ -383,13 +557,14 @@ editor_draw_status_bar(struct abuf *ab)
                        "%.20s - %d lines, mode: %s\x1b[m\x1b[7m",
                        config.filename ? config.filename : "No name",
                        config.numrows,
-                       config.mode == VIEW ? "\x1b[32mVIEW" : "\x1b[31mINSERT");
+                       config.mode == VIEW ? "\x1b[32mVIEW" : (config.mode == INSERT ? "\x1b[31mINSERT" : "\x1b[33mCLI"));
     len = len > config.screen_rows ? config.screen_rows : len;
     ab_append(ab, buf, len);
     while (len < config.screen_cols) {
         ab_append(ab, " ", 1);
         len++;
     }
+    ab_append(ab, "\r\n", 2);
     ab_append(ab, "\x1b[m", 4);
 }
 
@@ -457,6 +632,7 @@ editor_refresh_screen()
     editor_draw_rows(&ab);
     editor_draw_status_bar(&ab);
     editor_draw_message_bar(&ab);
+    editor_draw_cli_prompt(&ab);
 
     char buf[32];
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (config.cy - config.rowoff) + 1,
@@ -494,10 +670,11 @@ init_editor()
     config.filename = NULL;
     config.status_msg[0] = '\0';
     config.status_msg_time = time(NULL);
+    config.cli_buf[0] = '\0';
 
     if (get_window_size(&config.screen_rows, &config.screen_cols) == -1)
         die("get_window_size");
-    config.screen_rows -= 2;
+    config.screen_rows -= 3;
 }
 
 int
