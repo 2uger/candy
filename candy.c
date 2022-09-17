@@ -153,7 +153,7 @@ editor_process_cli_cmd()
             exit(0);
             break;
         default:
-            editor_set_status_message("Undefined cmd");
+            editor_set_status_message("Undefined cmd: %c", config.cli_buf[0]);
             break;
     }
 }
@@ -467,11 +467,6 @@ editor_process_keypress()
             case ':':
                 config.mode = CLI;
                 break;
-            case CTRLKEY('q'):
-                write(STDOUT_FILENO, "\x1b[2J", 4);
-                write(STDOUT_FILENO, "\x1b[H", 3);
-                exit(0);
-                break;
             case '\r':
                 break;
             case 'b':
@@ -498,12 +493,6 @@ editor_process_keypress()
         }
     } else if (config.mode == INSERT) {
         switch (c) {
-            // TODO: for debug purposes
-            case CTRLKEY('q'):
-                write(STDOUT_FILENO, "\x1b[2J", 4);
-                write(STDOUT_FILENO, "\x1b[H", 3);
-                exit(0);
-                break;
             case '\x1b':
             case CTRLKEY('c'):
                 config.mode = VIEW;
@@ -522,28 +511,39 @@ editor_process_keypress()
         switch (c) {
             case '\x1b':
                 config.mode = VIEW;
+                config.cli_buf[0] = 0;
                 break;
             case '\r':
                 config.mode = VIEW;
                 editor_process_cli_cmd();
+                config.cli_buf[0] = 0;
                 break;
             default:
                 config.cli_buf[0] = c;
                 break;
         }
-
     }
 }
 
 /*** output ***/
 
 void
+editor_draw_empty(struct abuf *ab, int from, int to)
+{
+    while (from < to) {
+        ab_append(ab, " ", 1);
+        from++;
+    }
+}
+
+void
 editor_draw_cli_prompt(struct abuf *ab)
 {
-    // TODO: erase old
     if (config.mode == CLI) {
         ab_append(ab, ":", 1);
         ab_append(ab, config.cli_buf, 1);
+    } else {
+        editor_draw_empty(ab, 0, config.screen_cols);
     }
 }
 
@@ -552,19 +552,19 @@ editor_draw_status_bar(struct abuf *ab)
 {
     ab_append(ab, "\x1b[7m", 4);
 
-    char buf[80];
+    char buf[120];
     int len = snprintf(buf, sizeof(buf),
-                       "%.20s - %d lines, mode: %s\x1b[m\x1b[7m",
+                       "%.20s - %d lines, mode: %s\x1b[m\x1b[7m, pos: %d, %d",
                        config.filename ? config.filename : "No name",
                        config.numrows,
-                       config.mode == VIEW ? "\x1b[32mVIEW" : (config.mode == INSERT ? "\x1b[31mINSERT" : "\x1b[33mCLI"));
+                       config.mode == VIEW ? "\x1b[32mVIEW" : (config.mode == INSERT ? "\x1b[31mINSERT" : "\x1b[33mCLI"),
+                       config.cy + 1, config.cx + 1);
     len = len > config.screen_rows ? config.screen_rows : len;
     ab_append(ab, buf, len);
-    while (len < config.screen_cols) {
-        ab_append(ab, " ", 1);
-        len++;
-    }
-    ab_append(ab, "\r\n", 2);
+
+    // 12 - offset for special escape sequences
+    editor_draw_empty(ab, len - 12, config.screen_cols);
+
     ab_append(ab, "\x1b[m", 4);
 }
 
@@ -575,13 +575,10 @@ editor_draw_message_bar(struct abuf *ab)
     msglen = msglen > config.screen_cols ? config.screen_cols : msglen;
     if (msglen && time(NULL) - config.status_msg_time < 3) {
         ab_append(ab, config.status_msg, msglen);
+        editor_draw_empty(ab, msglen, config.screen_cols);
         return;
     }
-    int l = 0;
-    while (l < config.screen_cols) {
-        ab_append(ab, " ", 1);
-        l++;
-    }
+    editor_draw_empty(ab, 0, config.screen_cols);
 }
 
 void
