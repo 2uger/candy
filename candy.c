@@ -23,6 +23,11 @@ typedef struct erow {
     char *chars;
 } erow;
 
+typedef struct cmd {
+    int size;
+    char chars[10];
+} cmd;
+
 struct EditorConfig {
     Mode mode;
     int cx, cy;  // cursor position
@@ -35,7 +40,8 @@ struct EditorConfig {
     char status_msg[80];
     time_t status_msg_time;
     erow *row;
-    char cli_buf[10];
+    char cli_buf[1];
+    cmd cmd;
     struct termios orig_termios;
 };
 
@@ -43,6 +49,10 @@ struct EditorConfig config;
 
 void editor_set_status_message(const char *fmt, ...);
 void editor_save();
+void editor_del_row(int);
+void editor_del_char(int, int);
+void editor_move_cursor(char key);
+void editor_insert_row(int at, char *s, size_t len);
 
 /*** terminal ***/
 
@@ -136,6 +146,116 @@ get_window_size(int *rows, int *cols)
         return 0;
     }
     
+}
+
+/*** Command buffer ***/
+
+void
+editor_erase_cmd()
+{
+    config.cmd.size = 0;
+    for (int i = 0; i < 10; i++) {
+        config.cmd.chars[i] = '_';
+    }
+}
+
+void
+editor_process_cmd_char(char c)
+{
+    config.cmd.chars[config.cmd.size] = c;
+    config.cmd.size++;
+
+    // flag to show, that cmd in buffer executed and we need to clear it
+    int exec = 0;
+
+    switch (config.cmd.chars[0]) {
+        case ':':
+            config.mode = CLI;
+            exec = 1;
+            break;
+        case '\r':
+            exec = 1;
+            break;
+        case 'b':
+        case 'w':
+        case '$':
+        case '0':
+        case CTRLKEY('d'):
+        case CTRLKEY('u'):
+        case 'j':
+        case 'k':
+        case 'h':
+        case 'l':
+            exec = 1;
+            editor_move_cursor(c);
+            break;
+        case 'i':
+            exec = 1;
+            config.mode = INSERT;
+            break;
+        case 'o':
+            editor_insert_row(config.cy + 1, "", 0);
+            exec = 1;
+            config.mode = INSERT;
+            config.cy++;
+            config.cx = 0;
+            break;
+        case 'O':
+            editor_insert_row(config.cy - 1, "", 0);
+            exec = 1;
+            config.mode = INSERT;
+            config.cy--;
+            config.cx = 0;
+            break;
+        case 'Z':
+            exec = 1;
+            editor_save();
+            break;
+        case 'x':
+            exec = 1;
+            editor_del_char(0, 0);
+            break;
+        case 'X':
+            exec = 1;
+            editor_del_char(-1, -1);
+            break;
+        case 'G':
+            config.cy = config.numrows - 1;
+            exec = 1;
+            break;
+        // compound commands
+        case 'd':
+            switch (config.cmd.chars[1]) {
+                case '_':
+                    break;
+                case 'd':
+                    editor_del_row(config.cy);
+                    exec = 1;
+                    break;
+                default:
+                    exec = 1;
+                    break;
+            }
+            break;
+        case 'g':
+            switch (config.cmd.chars[1]) {
+                case '_':
+                    break;
+                case 'g':
+                    config.cy = 0;
+                    exec = 1;
+                    break;
+                default:
+                    exec = 1;
+                    break;
+            }
+            break;
+        default:
+            exec = 1;
+            break;
+    }
+    if (exec)
+        editor_erase_cmd();
 }
 
 /*** Cli prompt ***/
@@ -276,7 +396,7 @@ editor_insert_char(int c)
 }
 
 void
-editor_del_char()
+editor_del_char(int char_off, int cx_off)
 {
     if (config.cy == config.numrows)
         return;
@@ -285,8 +405,8 @@ editor_del_char()
 
     erow *row = &config.row[config.cy];
     if (config.cx > 0) {
-        editor_row_del_char(row, config.cx - 1);
-        config.cx--;
+        editor_row_del_char(row, config.cx + char_off);
+        config.cx += cx_off;
     } else {
         config.cx = config.row[config.cy - 1].size;
         editor_row_append_string(&config.row[config.cy - 1], row->chars, row->size);
@@ -367,11 +487,6 @@ editor_save()
 
 /*** input ***/
 
-#define MV_UP    'k'
-#define MV_DOWN  'j'
-#define MV_LEFT  'h'
-#define MV_RIGHT 'l'
-
 void
 editor_move_cursor(char key)
 {
@@ -379,16 +494,16 @@ editor_move_cursor(char key)
 
     int space = 0;
     switch (key) {
-        case MV_DOWN:
+        case 'j':
             config.cy = (config.cy < config.numrows - 1 ? config.cy + 1 : config.cy);
             break;
-        case MV_UP:
+        case 'k':
             config.cy = (config.cy != 0 ? config.cy - 1 : config.cy);
             break;
-        case MV_LEFT:
+        case 'h':
             config.cx = (config.cx > 0 ? config.cx - 1 : config.cx);
             break;
-        case MV_RIGHT:
+        case 'l':
             if (row && config.cx <= row->size - 2)
                 config.cx++;
             break;
@@ -454,8 +569,7 @@ editor_move_cursor(char key)
 
     row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
     int rowlen = row ? row->size : 0;
-    if (config.cx > rowlen)
-        config.cx = rowlen;
+    config.cx = config.cx > row->size ? row->size : config.cx;
 }
 
 void
@@ -463,34 +577,7 @@ editor_process_keypress()
 {
     char c = editor_read_key();
     if (config.mode == VIEW) {
-        switch (c) {
-            case ':':
-                config.mode = CLI;
-                break;
-            case '\r':
-                break;
-            case 'b':
-            case 'w':
-            case '$':
-            case '0':
-            case CTRLKEY('d'):
-            case CTRLKEY('u'):
-            case MV_DOWN:
-            case MV_UP:
-            case MV_LEFT:
-            case MV_RIGHT:
-                editor_move_cursor(c);
-                break;
-            case 'i':
-                config.mode = INSERT;
-                break;
-            case 'Z':
-                editor_save();
-                break;
-            case 'x':
-                editor_del_char();
-                break;
-        }
+        editor_process_cmd_char(c); 
     } else if (config.mode == INSERT) {
         switch (c) {
             case '\x1b':
@@ -501,7 +588,7 @@ editor_process_keypress()
                 editor_insert_new_line();
                 break;
             case 127:
-                editor_del_char();
+                editor_del_char(-1, -1);
                 break;
             default:
                 editor_insert_char(c);
@@ -668,6 +755,7 @@ init_editor()
     config.status_msg[0] = '\0';
     config.status_msg_time = time(NULL);
     config.cli_buf[0] = '\0';
+    config.cmd.size = 0;
 
     if (get_window_size(&config.screen_rows, &config.screen_cols) == -1)
         die("get_window_size");
