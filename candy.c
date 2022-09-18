@@ -12,10 +12,7 @@
 
 #define CTRLKEY(k) ((k) & 0x1f)
 
-typedef enum Mode {
-    INSERT,
-    VIEW,
-} Mode;
+typedef enum Mode { INSERT, VIEW } Mode;
 
 typedef struct erow {
     int size;
@@ -71,8 +68,9 @@ die(const char *s)
 void
 disable_raw_mode()
 {
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &config.orig_termios) == -1)
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &config.orig_termios) == -1) {
         die("tcsetattr");
+    }
 }
 
 void
