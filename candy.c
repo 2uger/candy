@@ -700,12 +700,8 @@ editor_move_cursor(char key)
 
     row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
     int rowlen = row ? row->size : 0;
-    if (config.cx > rowlen) {
-        if (rowlen== 0) {
-            config.cx = 0;
-        } else {
-            config.cx = rowlen- 1;
-        }
+    if (config.cx >= rowlen) {
+        config.cx = rowlen == 0 ? 0 : rowlen - 1;
     }
 }
 
