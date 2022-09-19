@@ -194,18 +194,16 @@ editor_process_cmd(char c)
             exec = 1;
             config.mode = INSERT;
             break;
+        case 'a':
+            config.cx += 1;
+            config.mode = INSERT;
+            exec = 1;
+            break;
         case 'o':
             editor_insert_row(config.cy + 1, "", 0);
             exec = 1;
             config.mode = INSERT;
             config.cy++;
-            config.cx = 0;
-            break;
-        case 'O':
-            editor_insert_row(config.cy - 1, "", 0);
-            exec = 1;
-            config.mode = INSERT;
-            config.cy--;
             config.cx = 0;
             break;
         case 'Z':
@@ -268,7 +266,10 @@ void
 editor_cli_prompt()
 {
     size_t bufsize = 20;
-    char *buf = malloc(bufsize);
+    char *buf;
+    if ((buf = malloc(bufsize)) == NULL) {
+        return;
+    }
     size_t buflen = 1;
     buf[0] = ':';
     buf[1] = '\0';
@@ -310,7 +311,9 @@ editor_cli_prompt()
 
     switch (buf[1]) {
         case 'w':
-            filename = malloc(255);
+            if ((filename = malloc(255)) == NULL) {
+                return;
+            }
             filename[fn_size] = '\0';
 
             char *fn_start = &buf[2];
@@ -392,12 +395,22 @@ editor_insert_row(int at, char *s, size_t len)
         return;
     }
 
-    config.row = realloc(config.row, sizeof(erow_t) * (config.numrows + 1));
+    erow_t *n_row = realloc(config.row, sizeof(erow_t) * (config.numrows + 1));
+    if (n_row == NULL) {
+        return;
+    }
+    config.row = n_row;
     memmove(&config.row[at + 1], &config.row[at], sizeof(erow_t) * (config.numrows - at));
 
     erow_t *r = &config.row[at];
     r->size = len;
-    r->chars = malloc(len + 1);
+
+    char *n_chars = malloc(len + 1);
+    if (n_chars == NULL) {
+        return;
+    }
+    r->chars = n_chars;
+
     memcpy(r->chars, s, len);
 
     r->chars[len] = '\0';
@@ -424,7 +437,13 @@ editor_row_insert_char(erow_t *row, int at, int c)
     if (at < 0 || at > row->size) {
         at = row->size;
     }
-    row->chars = realloc(row->chars, row->size + 2);  // 2 = new char and \0
+
+    char *n_chars = realloc(row->chars, row->size + 2);  // 2 = new char and \0
+    if (n_chars == NULL) {
+        return;
+    }
+    row->chars = n_chars;
+
     memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
     row->size++;
     row->chars[at] = c;
@@ -434,7 +453,12 @@ editor_row_insert_char(erow_t *row, int at, int c)
 void
 editor_row_append_string(erow_t *row, char *s, size_t len)
 {
-    row->chars = realloc(row->chars, row->size + len + 1);
+    char *n_chars = realloc(row->chars, row->size + len + 1);
+    if (n_chars == NULL) {
+        return;
+    }
+    row->chars = n_chars;
+
     memcpy(&row->chars[row->size], s, len);
     row->size += len;
     row->chars[row->size] = '\0';
@@ -510,7 +534,10 @@ editor_rows_to_string(int *len)
     }
     *len = total;
 
-    char *buf = malloc(total);
+    char *buf;
+    if ((buf = malloc(total)) == NULL) {
+        return NULL;
+    }
     char *p = buf;
     for (int i = 0; i < config.numrows; i++) {
         memcpy(p, config.row[i].chars, config.row[i].size);
@@ -564,6 +591,10 @@ editor_save(char *new_filename)
 
     int len;
     char *buf = editor_rows_to_string(&len);
+    if (buf == NULL) {
+        editor_set_status_message("failed file io");
+        return;
+    }
 
     int fd = open(filename, O_RDWR | O_CREAT, 0644);
     if (fd != -1) {
@@ -669,7 +700,13 @@ editor_move_cursor(char key)
 
     row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
     int rowlen = row ? row->size : 0;
-    config.cx = config.cx > row->size ? row->size : config.cx;
+    if (config.cx > rowlen) {
+        if (rowlen== 0) {
+            config.cx = 0;
+        } else {
+            config.cx = rowlen- 1;
+        }
+    }
 }
 
 void
@@ -714,14 +751,14 @@ editor_draw_status_bar(struct abuf *ab)
 {
     ab_append(ab, "\x1b[7m", 4);
 
-    char buf[120];
+    char buf[140];
     int len = snprintf(buf, sizeof(buf),
                        "%s%.20s-%d lines mode: %s\x1b[m\x1b[7m, pos: %d, %d",
                        config.dirty ? "(modified) " : "",
                        config.filename ? config.filename : "No name",
                        config.numrows,
                        config.mode == VIEW ? "\x1b[32mVIEW" : "\x1b[31mINSERT",
-                       config.cy + 1, config.cx + 1);
+                       config.cy, config.cx);
     len = len > config.screen_cols ? config.screen_cols : len;
     ab_append(ab, buf, len);
 
@@ -786,7 +823,6 @@ void
 editor_refresh_screen()
 {
     editor_scroll();
-
     struct abuf ab = ABUF_INIT;
 
     ab_append(&ab, "\x1b[?25l", 6); // hide cursor
