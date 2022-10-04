@@ -17,7 +17,6 @@ Move forward, backward one word
 Move to the start, end of the file
 * dd  
 Delete current row
----
 * i  
 Insert mode on current position
 * a  
